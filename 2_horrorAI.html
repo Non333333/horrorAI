@@ -1,0 +1,618 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>White Room Footsteps</title>
+    <style>
+        body {
+            background-color: #111;
+            color: #ddd;
+            font-family: "Courier New", Courier, monospace;
+            margin: 0;
+            padding: 10px;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            box-sizing: border-box;
+        }
+        #game-output {
+            flex: 1;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            border-bottom: 1px solid #444;
+            padding-bottom: 10px;
+            margin-bottom: 10px;
+            font-size: 14px;
+            line-height: 1.4;
+        }
+        .log-entry { margin-bottom: 8px; }
+        .log-turn { color: #888; font-size: 0.8em; border-top: 1px dashed #333; margin-top: 10px; padding-top: 5px;}
+        .highlight { color: #fff; font-weight: bold; }
+        .danger { color: #ff6666; }
+        .item-get { color: #66ff66; }
+        
+        /* Mobile Controls */
+        #controls {
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+        }
+        .row { display: flex; gap: 5px; justify-content: center; }
+        button {
+            background: #333;
+            color: #fff;
+            border: 1px solid #555;
+            padding: 10px;
+            border-radius: 4px;
+            flex: 1;
+            font-family: inherit;
+            touch-action: manipulation; /* Zoom disable on double tap */
+        }
+        button:active { background: #555; }
+        input[type="text"] {
+            background: #222;
+            border: 1px solid #444;
+            color: #fff;
+            padding: 10px;
+            width: 100%;
+            box-sizing: border-box;
+            font-family: inherit;
+        }
+        .hidden { display: none; }
+    </style>
+</head>
+<body>
+
+<div id="game-output"></div>
+
+<div id="controls">
+    <div class="row">
+        <input type="text" id="cmd-input" placeholder="コマンド入力 (例: use 1)" autocomplete="off">
+        <button onclick="submitCommand()" style="flex: 0 0 60px;">Send</button>
+    </div>
+    <div class="row">
+        <button onclick="handleBtn('n')">北(N)</button>
+    </div>
+    <div class="row">
+        <button onclick="handleBtn('w')">西(W)</button>
+        <button onclick="handleBtn('search')">調査</button>
+        <button onclick="handleBtn('e')">東(E)</button>
+    </div>
+    <div class="row">
+        <button onclick="handleBtn('s')">南(S)</button>
+    </div>
+    <div class="row">
+        <button onclick="handleBtn('status')">状態</button>
+        <button onclick="handleBtn('use')">使用</button>
+        <button onclick="handleBtn('rest')">休憩</button>
+        <button onclick="handleBtn('help')">?</button>
+    </div>
+</div>
+
+<script>
+// --- Game Constants & Utilities ---
+const W = 5, H = 5;
+const WRAP = 40; // Approx for mobile
+
+function rng(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
+function rngChoice(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
+function manhattan(a, b) { return Math.abs(a.x - b.x) + Math.abs(a.y - b.y); }
+function parseCoord(key) { const [x, y] = key.split(',').map(Number); return {x, y}; }
+function toKey(x, y) { return `${x},${y}`; }
+
+// --- Game State ---
+let world = {
+    turn: 0,
+    adj: {}, // "x,y" -> {n: "x,y", ...}
+    rooms: {},
+    start: {x:0, y:0},
+    exit: {x:W-1, y:H-1},
+    playerPos: {x:0, y:0},
+    hp: 10,
+    san: 70,
+    noise: 0,
+    inv: [],
+    flags: new Set(),
+    seenLogs: new Set(),
+    hunterPos: null,
+    saltTurns: 0,
+    logs: {},
+    items: {
+        "cloth": {name:"消毒布", desc:"血の匂いをごまかす。少しだけ体力が戻る。"},
+        "battery": {name:"電池", desc:"明かりを保つための電池。暗い部屋での失敗率を下げる。"},
+        "salt": {name:"塩の小袋", desc:"床に落とすと、しばらく“入ってきづらくなる”。"},
+        "tape": {name:"テープ", desc:"古い録音。再生するとヒントが出ることがある。"},
+        "mirror": {name:"小さな鏡", desc:"直接見てはいけないものを、遠回しに見るための鏡。"},
+        "key": {name:"非常扉の鍵", desc:"出口の鍵。冷たい。"}
+    },
+    gameOver: false,
+    encounterActive: false
+};
+
+// --- Initialization ---
+const LOG_DATA = {
+    "L01": { title: "録音01", text: ["「…聞こえる？　鍵は“保管庫”に…いや、違う。あそこは、見られてる」", "「白い部屋はまっすぐじゃない。戻ってくる。戻される」", "「足音が、人数の数にならない。増える」"], flags: ["hint_storage"] },
+    "L02": { title: "録音02", text: ["「おい、塩。…笑うな。効くんだよ。冗談じゃなく」", "「床に落とせ。線を引け。たぶん、あれは境界を嫌う」", "「それでも…入ってくる時は入ってくる」"], flags: ["hint_salt"] },
+    "L03": { title: "メモ", text: ["『鏡。鏡。鏡。』", "『直接読むな。直接見たら、文字が“身体”に移る』", "『反射で見ろ。反射なら、まだ、戻れる』"], flags: ["hint_mirror"] },
+    "L04": { title: "監視記録 抜粋", text: ["「被験者は“出口”を認識できる時間帯がある」", "「長引けば長引くほど、出口は“出口でなくなる”」", "「要注意：音を立てた個体は回収率が高い」"], flags: ["hint_time"] },
+    "L05": { title: "会話の断片", text: ["「名前、呼んだ？」", "「呼んでない。……呼べないだろ。ここじゃ」", "「でも聞こえた。“おまえ”じゃなくて、私の名前」"], flags: [] },
+    "L06": { title: "録音03", text: ["「非常扉は右に引くな。左だ。…逆だと思うだろ？」", "「鍵があっても、やり方を間違えると…」", "「…やめろ、足音が近い」"], flags: ["hint_exit_left"] },
+    "L07": { title: "紙片", text: ["『白は清潔じゃない。白は、隠すための色』", "『あなたの手は、もう白くならない』"], flags: [] }
+};
+
+function initGame() {
+    printLine("白い天井。喉が乾いている。\n遠くで、足音。", "highlight");
+    world.logs = JSON.parse(JSON.stringify(LOG_DATA));
+    generateMap();
+    placeContent();
+    spawnHunter();
+    printRoom();
+}
+
+function generateMap() {
+    // Basic Grid & Path
+    let x = 0, y = 0;
+    const path = [`${x},${y}`];
+    
+    // Simple random walk to exit
+    while(x !== world.exit.x || y !== world.exit.y) {
+        let moves = [];
+        if(x < world.exit.x) moves.push({x:x+1, y:y});
+        if(y < world.exit.y) moves.push({x:x, y:y+1});
+        if(x > 0 && Math.random() < 0.25) moves.push({x:x-1, y:y});
+        if(y > 0 && Math.random() < 0.25) moves.push({x:x, y:y-1});
+        
+        let next = moves.length > 0 ? rngChoice(moves) : {x:world.exit.x, y:world.exit.y};
+        connect({x,y}, next);
+        x = next.x; y = next.y;
+        path.push(toKey(x,y));
+    }
+    
+    // Extra connections
+    for(let i=0; i<12; i++) {
+        let ax = rng(0, W-1), ay = rng(0, H-1);
+        let dirs = [];
+        if(ax>0) dirs.push({x:ax-1, y:ay});
+        if(ax<W-1) dirs.push({x:ax+1, y:ay});
+        if(ay>0) dirs.push({x:ax, y:ay-1});
+        if(ay<H-1) dirs.push({x:ax, y:ay+1});
+        let b = rngChoice(dirs);
+        if(Math.random() < 0.75) connect({x:ax, y:ay}, b);
+    }
+
+    // Create Rooms
+    for(let Y=0; Y<H; Y++) {
+        for(let X=0; X<W; X++) {
+            let pos = {x:X, y:Y};
+            let key = toKey(X,Y);
+            let special = null;
+            if(X===0 && Y===0) special = "start";
+            if(X===W-1 && Y===H-1) special = "exit";
+            
+            let flavor = getFlavor(pos, special);
+            world.rooms[key] = {
+                name: flavor.name,
+                base_desc: flavor.desc,
+                stealth: flavor.stealth,
+                loot: [],
+                logs: [],
+                special: special,
+                searched: false
+            };
+        }
+    }
+}
+
+function getFlavor(pos, special) {
+    if (special === "start") return {name:"目覚めの部屋", desc:"目を開けると白い天井。喉が乾いている。自分の名前が、思い出せない。", stealth:1};
+    if (special === "exit") return {name:"非常扉", desc:"扉の向こうに、風の匂い。近いのに、遠い。取っ手がひどく冷たい。", stealth:0};
+    
+    const flavors = [
+        {name:"白い廊下", desc:"白い壁。白い床。歩くたび、靴裏が薄く吸い付く。", stealth:1},
+        {name:"手洗い場", desc:"蛇口は固い。水の匂いだけが残っている。金属が冷たい。", stealth:2},
+        {name:"記録室", desc:"棚。ラベル。剥がれた粘着。紙の端が、誰かの爪で波打っている。", stealth:1},
+        {name:"処置室", desc:"ベッドの脚が一本だけ短い。揺れる。何もないのに。", stealth:1},
+        {name:"保管庫", desc:"鍵のかかっていたはずの箱が、口を開けている。奥が暗い。", stealth:2},
+        {name:"監視室", desc:"黒いガラス。こちらが見えていないふりをして、見ている。", stealth:0},
+        {name:"階段踊り場", desc:"上と下。どちらも同じ高さに見える。首が痛い。", stealth:1},
+        {name:"配電盤前", desc:"焦げた匂い。小さな火花の記憶だけが貼り付いている。", stealth:0},
+        {name:"休憩室", desc:"椅子が一脚だけ壁に向いている。背もたれが、少し濡れている。", stealth:2}
+    ];
+    
+    let base = rngChoice(flavors);
+    if ((pos.x + pos.y) % 4 === 0 && Math.random() < 0.35) {
+        return {name:"小部屋", desc:"広くない。白が近い。耳の奥で、誰かが息を吸う音。", stealth: base.stealth};
+    }
+    return base;
+}
+
+function connect(a, b) {
+    const ka = toKey(a.x, a.y);
+    const kb = toKey(b.x, b.y);
+    if(ka === kb) return;
+    
+    if(!world.adj[ka]) world.adj[ka] = {};
+    if(!world.adj[kb]) world.adj[kb] = {};
+    
+    if(b.x === a.x+1) { world.adj[ka]['e'] = b; world.adj[kb]['w'] = a; }
+    else if(b.x === a.x-1) { world.adj[ka]['w'] = b; world.adj[kb]['e'] = a; }
+    else if(b.y === a.y+1) { world.adj[ka]['s'] = b; world.adj[kb]['n'] = a; }
+    else if(b.y === a.y-1) { world.adj[ka]['n'] = b; world.adj[kb]['s'] = a; }
+}
+
+function placeContent() {
+    let keys = Object.keys(world.rooms).filter(k => k !== toKey(0,0) && k !== toKey(W-1,H-1));
+    // Shuffle
+    for (let i = keys.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [keys[i], keys[j]] = [keys[j], keys[i]];
+    }
+    
+    // Special rooms
+    const rStorage = world.rooms[keys.pop()];
+    rStorage.special = "storage"; rStorage.name = "保管庫"; rStorage.stealth = 2;
+    rStorage.loot.push("key");
+    
+    const rSurveil = world.rooms[keys.pop()];
+    rSurveil.special = "surveil"; rSurveil.name = "監視室"; rSurveil.stealth = 0;
+    
+    const rRecord = world.rooms[keys.pop()];
+    rRecord.special = "records"; rRecord.name = "記録室"; rRecord.stealth = 1;
+    
+    // Items
+    const items = ["cloth", "battery", "salt", "tape", "mirror", "tape", "salt"];
+    for(let it of items) {
+        if(keys.length === 0) break;
+        world.rooms[keys.pop()].loot.push(it);
+    }
+    
+    // Logs (Simplified placement)
+    Object.keys(world.logs).forEach(lid => {
+        let target = rngChoice(Object.keys(world.rooms));
+        if (lid === "L04") target = toKey(parseCoord(target).x, parseCoord(target).y); // Just place randomly for JS port simplicity or implement strict logic
+        // For simplicity in JS port, just scattering randomly except start/exit where possible
+        if(world.rooms[target].special !== "start") {
+            world.rooms[target].logs.push(lid);
+        }
+    });
+}
+
+function spawnHunter() {
+    let cands = Object.keys(world.rooms).filter(k => k !== toKey(0,0));
+    world.hunterPos = parseCoord(rngChoice(cands));
+}
+
+// --- IO Functions ---
+function printLine(text, className="") {
+    const out = document.getElementById("game-output");
+    const div = document.createElement("div");
+    div.className = "log-entry " + className;
+    div.textContent = text;
+    out.appendChild(div);
+    out.scrollTop = out.scrollHeight;
+}
+
+function handleBtn(cmd) {
+    const input = document.getElementById("cmd-input");
+    input.value = cmd;
+    submitCommand();
+}
+
+function submitCommand() {
+    if(world.gameOver) return;
+    const input = document.getElementById("cmd-input");
+    const cmdStr = input.value.trim().toLowerCase();
+    input.value = "";
+    if(!cmdStr) return;
+
+    printLine(`> ${cmdStr}`, "log-turn");
+
+    if (world.encounterActive) {
+        resolveEncounter(cmdStr);
+        return;
+    }
+
+    // Try Exit first
+    const r = world.rooms[toKey(world.playerPos.x, world.playerPos.y)];
+    if(r.special === "exit" && (cmdStr === "use key" || cmdStr === "use")) {
+        tryExit();
+        return;
+    }
+
+    const moves = world.adj[toKey(world.playerPos.x, world.playerPos.y)] || {};
+    
+    if (["n","s","e","w"].includes(cmdStr)) {
+        if (moves[cmdStr]) {
+            world.playerPos = moves[cmdStr];
+            world.noise += 1;
+            tick();
+        } else {
+            printLine("壁。白い。近い。");
+            world.san -= 1;
+            world.noise += 1;
+            tick();
+        }
+    } else if (cmdStr.startsWith("search")) {
+        doSearch();
+        tick();
+    } else if (cmdStr.startsWith("use")) {
+        const parts = cmdStr.split(" ");
+        if(parts[1]) useItem(parts[1]); 
+        else showUseMenu();
+    } else if (cmdStr.startsWith("rest")) {
+        doRest();
+        tick();
+    } else if (cmdStr.startsWith("status")) {
+        showStatus();
+    } else if (cmdStr.startsWith("help")) {
+        printLine("n/s/e/w:移動, search:調査, use:使用, rest:休憩");
+    } else {
+        printLine("その動きは、ここではうまくいかない。");
+    }
+}
+
+// --- Logic Actions ---
+function printRoom() {
+    if(world.gameOver) return;
+    const key = toKey(world.playerPos.x, world.playerPos.y);
+    const room = world.rooms[key];
+    const d = manhattan(world.playerPos, world.hunterPos);
+    let foot = d===0?"ここにいる": d===1?"すぐそこ": d===2?"近い": d<=4?"遠くない":"遠い";
+    
+    printLine(`\nTURN ${world.turn} | ${room.name}`, "highlight");
+    
+    // Dynamic desc
+    let desc = room.base_desc;
+    if(world.san <= 35 && Math.random() < 0.35) desc = desc.replace("白", "しろ");
+    printLine(desc);
+    
+    printLine(`足音：${foot}`, "danger");
+    if(world.saltTurns > 0) printLine("床の塩が、かすかに白く光っている。");
+    
+    const moves = world.adj[key] || {};
+    printLine(`移動可能: ${Object.keys(moves).join(" ").toUpperCase()}`);
+    
+    // Whisper
+    if(Math.random() < 0.4) {
+        const whispers = ["壁の白が、薄い皮膚みたいに見える。", "自分の靴音が、一拍遅れて返ってくる。"];
+        if(d<=2) whispers.push("足音が、数を間違えている。", "気配が、ドアの向こうで立ち止まった。");
+        printLine(rngChoice(whispers));
+    }
+}
+
+function doSearch() {
+    const r = world.rooms[toKey(world.playerPos.x, world.playerPos.y)];
+    world.noise += 1;
+    if(!r.searched) {
+        printLine("手を伸ばす。白の隙間を探る。");
+        r.searched = true;
+        // Logs
+        if(r.logs.length > 0) {
+            let lid = r.logs.shift();
+            playLog(lid);
+        }
+        // Loot
+        if(r.loot.length > 0) {
+            let item = r.loot.shift();
+            world.inv.push(item);
+            printLine(`見つけた：${world.items[item].name}`, "item-get");
+            if(item==="key") world.flags.add("has_key");
+        } else {
+            if(Math.random()<0.75) {
+                printLine("何もない。指が濡れる。");
+                world.san -= 2;
+            }
+        }
+    } else {
+        printLine("同じ場所。触感だけが違う。");
+        world.san -= 1;
+    }
+}
+
+function showUseMenu() {
+    if(world.inv.length === 0) { printLine("手元に何もない。"); return; }
+    printLine("どれを使う？ (use 1, use 2...)");
+    world.inv.forEach((it, i) => {
+        printLine(`${i+1}. ${world.items[it].name}`);
+    });
+}
+
+function useItem(idxStr) {
+    const idx = parseInt(idxStr) - 1;
+    if(isNaN(idx) || idx < 0 || idx >= world.inv.length) { printLine("指定が間違っている。"); return; }
+    const item = world.inv[idx];
+    
+    if(item === "cloth") {
+        world.hp = Math.min(10, world.hp+3);
+        printLine("傷が塞がる気がする。HP回復。");
+        world.inv.splice(idx, 1);
+        tick();
+    } else if(item === "salt") {
+        world.saltTurns = 6;
+        printLine("塩で結界を張った。");
+        world.inv.splice(idx, 1);
+        tick();
+    } else if(item === "battery") {
+        world.san = Math.min(70, world.san + 5);
+        printLine("明かりが心強い。SAN回復。");
+        world.inv.splice(idx, 1);
+        tick();
+    } else if (item === "mirror") {
+        printLine("鏡は使い捨てではない。持っているだけで効果がある。");
+    } else if (item === "key") {
+        printLine("ここでは使えない。");
+    } else {
+        printLine("使えない。");
+    }
+}
+
+function doRest() {
+    printLine("床に座る。");
+    if(Math.random() < 0.55) {
+        world.hp += 2; world.san += 1;
+        printLine("少し回復した。");
+    } else {
+        world.san -= 3;
+        printLine("悪夢を見た。");
+    }
+    world.noise += 2;
+}
+
+function playLog(lid) {
+    const l = world.logs[lid];
+    if(!l) return;
+    printLine(`\n--- ${l.title} ---`, "highlight");
+    l.text.forEach(t => printLine(t));
+    l.flags.forEach(f => world.flags.add(f));
+    world.seenLogs.add(lid);
+    world.san -= 2; 
+    world.noise += 1;
+}
+
+function showStatus() {
+    printLine(`HP:${world.hp} SAN:${world.san} NOISE:${world.noise} INV:${world.inv.length}`);
+}
+
+// --- Turn & Hunter ---
+function tick() {
+    if(world.gameOver) return;
+    world.turn++;
+    if(world.turn % 3 === 0) world.san--;
+    if(world.noise > 0) world.noise--;
+    if(world.saltTurns > 0) world.saltTurns--;
+    
+    // Hunter Move
+    moveHunter();
+    
+    if (world.hp <= 0) endGame("死亡：物理的限界");
+    else if (world.san <= 0) endGame("発狂：精神的限界");
+    else if (manhattan(world.playerPos, world.hunterPos) === 0) {
+        startEncounter();
+    } else {
+        printRoom();
+    }
+}
+
+function moveHunter() {
+    const d = manhattan(world.hunterPos, world.playerPos);
+    let chance = 0.2 + (0.05 * (6-d)) + (0.03 * world.noise);
+    if(world.saltTurns > 0) chance -= 0.2;
+    
+    // Simple approach logic
+    const moves = world.adj[toKey(world.hunterPos.x, world.hunterPos.y)];
+    if(!moves) return;
+    
+    if(Math.random() < chance) {
+        // Seek
+        let best = world.hunterPos, minDist = d;
+        Object.values(moves).forEach(pos => {
+            let dist = manhattan(pos, world.playerPos);
+            if(dist < minDist) { minDist = dist; best = pos; }
+        });
+        world.hunterPos = best;
+    } else {
+        // Random
+        const keys = Object.keys(moves);
+        if(keys.length > 0) world.hunterPos = moves[rngChoice(keys)];
+    }
+}
+
+// --- Encounter System ---
+function startEncounter() {
+    world.encounterActive = true;
+    printLine("\n!!! 遭遇 !!!", "danger");
+    printLine("足音が止まる。背後にいる。");
+    printLine("どうする？ (hide:隠れる, run:逃げる, fight:抗う)");
+}
+
+function resolveEncounter(act) {
+    if (act === "hide") {
+        let chance = 0.3 + (world.saltTurns>0 ? 0.2:0) - (world.noise*0.05);
+        if(Math.random() < chance) {
+            printLine("隠れ通せた…気配が遠ざかる。", "item-get");
+            world.encounterActive = false;
+            // teleport hunter slightly away
+            moveHunter();
+            printRoom();
+        } else {
+            let dmg = rng(4,7);
+            world.hp -= dmg;
+            printLine(`見つかった！ 捕まれる！ HP-${dmg}`, "danger");
+            checkDeath();
+        }
+    } else if (act === "run") {
+        let chance = 0.6 + (world.saltTurns>0 ? 0.1:0);
+        if(Math.random() < chance) {
+            // Move player random adj
+            const moves = world.adj[toKey(world.playerPos.x, world.playerPos.y)];
+            const keys = Object.keys(moves);
+            if(keys.length>0) {
+                world.playerPos = moves[rngChoice(keys)];
+                printLine("走って逃げた！", "highlight");
+                world.noise += 5;
+                world.encounterActive = false;
+                printRoom();
+            } else {
+                printLine("逃げ場がない！");
+                world.hp -= 3;
+                checkDeath();
+            }
+        } else {
+            printLine("足がもつれた。追いつかれる。", "danger");
+            world.hp -= 4;
+            checkDeath();
+        }
+    } else if (act === "fight") {
+        printLine("抗うが無駄だ。大ダメージ。", "danger");
+        world.hp -= 8;
+        checkDeath();
+    } else {
+        printLine("恐怖で動けない！ (hide/run/fight を入力)");
+    }
+}
+
+function checkDeath() {
+    if(world.hp <= 0) endGame("死亡：捕食された");
+    else {
+        world.encounterActive = false;
+        printRoom();
+    }
+}
+
+function tryExit() {
+    if(!world.flags.has("has_key")) {
+        printLine("鍵がない。");
+        return;
+    }
+    // Simple prompt for left/right
+    const choice = prompt("扉の取っ手をどちらに回す？ (left / right)");
+    const correct = world.flags.has("hint_exit_left") ? "left" : "right"; 
+    
+    // In original code, L06 says "Don't pull right. It's left."
+    // If they have hint, answer is left. If not, default guess usually fails.
+    // Simplifying logic: if input 'left', succeed.
+    
+    if(choice && choice.toLowerCase() === "left") {
+        endGame("脱出成功！ おめでとう。", true);
+    } else {
+        printLine("扉は開かない。警報が鳴り響く！", "danger");
+        world.hp -= 5;
+        world.hunterPos = world.playerPos; // Summon hunter
+        startEncounter();
+    }
+}
+
+function endGame(msg, win=false) {
+    world.gameOver = true;
+    printLine("\n====================", "highlight");
+    printLine(msg, win ? "item-get" : "danger");
+    printLine("====================");
+    printLine("ページを再読み込みしてリトライ");
+}
+
+// Start
+initGame();
+</script>
+</body>
+</html>
