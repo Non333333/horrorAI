@@ -1,0 +1,840 @@
+import random
+import sys
+import textwrap
+
+# =========================
+#  White Room Footsteps
+#  Single-file text horror exploration game
+# =========================
+
+W, H = 5, 5  # map size
+WRAP = 78
+
+def wrap(s):
+    return "\n".join(textwrap.wrap(s, width=WRAP))
+
+def rng_choice_weighted(items):
+    # items: list of (item, weight)
+    total = sum(w for _, w in items)
+    r = random.uniform(0, total)
+    upto = 0.0
+    for item, w in items:
+        upto += w
+        if r <= upto:
+            return item
+    return items[-1][0]
+
+def manhattan(a, b):
+    return abs(a[0]-b[0]) + abs(a[1]-b[1])
+
+class Room:
+    def __init__(self, rid, name, desc, stealth=0, loot=None, logs=None, special=None):
+        self.rid = rid
+        self.name = name
+        self.base_desc = desc
+        self.stealth = stealth  # higher = easier to hide
+        self.loot = loot or []  # list of item ids
+        self.logs = logs or []  # list of log ids
+        self.special = special  # e.g., "start", "exit", "storage", etc.
+        self.searched = False
+
+    def desc(self, world):
+        # Subtle horror distortion based on sanity + time
+        d = self.base_desc
+        if world.player_san <= 35 and random.random() < 0.35:
+            # Slight text glitch: replace a few characters
+            d = d.replace("白", "しろ", 1) if "白" in d else d
+        if world.turn >= 25 and random.random() < 0.25:
+            d += " それなのに、空気だけが古い。"
+        return d
+
+class World:
+    def __init__(self):
+        self.turn = 0
+        self.adj = {}          # (x,y) -> dict dir->(nx,ny)
+        self.rooms = {}        # (x,y) -> Room
+        self.start = (0, 0)
+        self.exit = (W-1, H-1)
+        self.player_pos = self.start
+
+        self.player_hp = 10
+        self.player_san = 70
+        self.player_noise = 0
+        self.player_inv = []   # list of item ids
+        self.flags = set()     # discovered facts
+        self.seen_logs = set()
+
+        self.hunter_pos = None
+        self.salt_turns = 0    # temporary ward turns
+
+        # content
+        self.items = {
+            "cloth": ("消毒布", "血の匂いをごまかす。少しだけ体力が戻る。"),
+            "battery": ("電池", "明かりを保つための電池。暗い部屋での失敗率を下げる。"),
+            "salt": ("塩の小袋", "床に落とすと、しばらく“入ってきづらくなる”。"),
+            "tape": ("テープ", "古い録音。再生するとヒントが出ることがある。"),
+            "mirror": ("小さな鏡", "直接見てはいけないものを、遠回しに見るための鏡。"),
+            "key": ("非常扉の鍵", "出口の鍵。冷たい。"),
+        }
+
+        self.logs = self._build_logs()
+        self._generate_map()
+        self._place_content()
+        self._spawn_hunter()
+
+    def _build_logs(self):
+        # Dialogue-heavy fragments. Keep them short, sharp, unsettling.
+        # Each log may unlock flags/hints.
+        return {
+            "L01": {
+                "title": "録音01",
+                "text": [
+                    "「…聞こえる？　鍵は“保管庫”に…いや、違う。あそこは、見られてる」",
+                    "「白い部屋はまっすぐじゃない。戻ってくる。戻される」",
+                    "「足音が、人数の数にならない。増える」",
+                ],
+                "flags": {"hint_storage"}
+            },
+            "L02": {
+                "title": "録音02",
+                "text": [
+                    "「おい、塩。…笑うな。効くんだよ。冗談じゃなく」",
+                    "「床に落とせ。線を引け。たぶん、あれは境界を嫌う」",
+                    "「それでも…入ってくる時は入ってくる」",
+                ],
+                "flags": {"hint_salt"}
+            },
+            "L03": {
+                "title": "メモ",
+                "text": [
+                    "『鏡。鏡。鏡。』",
+                    "『直接読むな。直接見たら、文字が“身体”に移る』",
+                    "『反射で見ろ。反射なら、まだ、戻れる』",
+                ],
+                "flags": {"hint_mirror"}
+            },
+            "L04": {
+                "title": "監視記録 抜粋",
+                "text": [
+                    "「被験者は“出口”を認識できる時間帯がある」",
+                    "「長引けば長引くほど、出口は“出口でなくなる”」",
+                    "「要注意：音を立てた個体は回収率が高い」",
+                ],
+                "flags": {"hint_time"}
+            },
+            "L05": {
+                "title": "会話の断片",
+                "text": [
+                    "「名前、呼んだ？」",
+                    "「呼んでない。……呼べないだろ。ここじゃ」",
+                    "「でも聞こえた。“おまえ”じゃなくて、私の名前」",
+                ],
+                "flags": set()
+            },
+            "L06": {
+                "title": "録音03",
+                "text": [
+                    "「非常扉は右に引くな。左だ。…逆だと思うだろ？」",
+                    "「鍵があっても、やり方を間違えると…」",
+                    "「…やめろ、足音が近い」",
+                ],
+                "flags": {"hint_exit_left"}
+            },
+            "L07": {
+                "title": "紙片",
+                "text": [
+                    "『白は清潔じゃない。白は、隠すための色』",
+                    "『あなたの手は、もう白くならない』",
+                ],
+                "flags": set()
+            }
+        }
+
+    def _generate_map(self):
+        # Build a guaranteed path start -> exit, then add random connections.
+        for y in range(H):
+            for x in range(W):
+                self.adj[(x,y)] = {}
+
+        # carve a random path
+        x, y = self.start
+        path = [(x,y)]
+        while (x,y) != self.exit:
+            moves = []
+            if x < self.exit[0]:
+                moves.append((x+1, y))
+            if y < self.exit[1]:
+                moves.append((x, y+1))
+            # add some randomness
+            if x > 0 and random.random() < 0.25:
+                moves.append((x-1, y))
+            if y > 0 and random.random() < 0.25:
+                moves.append((x, y-1))
+            nx, ny = random.choice(moves)
+            # connect
+            self._connect((x,y), (nx,ny))
+            x, y = nx, ny
+            path.append((x,y))
+
+        # add extra edges
+        extra = random.randint(8, 14)
+        for _ in range(extra):
+            ax, ay = random.randrange(W), random.randrange(H)
+            dirs = []
+            if ax > 0: dirs.append((ax-1, ay))
+            if ax < W-1: dirs.append((ax+1, ay))
+            if ay > 0: dirs.append((ax, ay-1))
+            if ay < H-1: dirs.append((ax, ay+1))
+            bx, by = random.choice(dirs)
+            if random.random() < 0.75:
+                self._connect((ax,ay), (bx,by))
+
+        # create rooms with themes
+        for y in range(H):
+            for x in range(W):
+                pos = (x,y)
+                special = None
+                if pos == self.start:
+                    special = "start"
+                elif pos == self.exit:
+                    special = "exit"
+
+                name, desc, stealth = self._room_flavor(pos, special)
+                self.rooms[pos] = Room(
+                    rid=f"R{x}{y}",
+                    name=name,
+                    desc=desc,
+                    stealth=stealth,
+                    special=special
+                )
+
+    def _room_flavor(self, pos, special):
+        x, y = pos
+        # pick based on coordinate-ish feel, but with randomness
+        flavors = [
+            ("白い廊下", "白い壁。白い床。歩くたび、靴裏が薄く吸い付く。", 1),
+            ("手洗い場", "蛇口は固い。水の匂いだけが残っている。金属が冷たい。", 2),
+            ("記録室", "棚。ラベル。剥がれた粘着。紙の端が、誰かの爪で波打っている。", 1),
+            ("処置室", "ベッドの脚が一本だけ短い。揺れる。何もないのに。", 1),
+            ("保管庫", "鍵のかかっていたはずの箱が、口を開けている。奥が暗い。", 2),
+            ("監視室", "黒いガラス。こちらが見えていないふりをして、見ている。", 0),
+            ("階段踊り場", "上と下。どちらも同じ高さに見える。首が痛い。", 1),
+            ("配電盤前", "焦げた匂い。小さな火花の記憶だけが貼り付いている。", 0),
+            ("休憩室", "椅子が一脚だけ壁に向いている。背もたれが、少し濡れている。", 2),
+        ]
+        if special == "start":
+            return ("目覚めの部屋", "目を開けると白い天井。喉が乾いている。自分の名前が、思い出せない。", 1)
+        if special == "exit":
+            return ("非常扉", "扉の向こうに、風の匂い。近いのに、遠い。取っ手がひどく冷たい。", 0)
+
+        base = random.choice(flavors)
+        # tweak: certain coords more likely to be special-ish
+        if (x+y) % 4 == 0 and random.random() < 0.35:
+            return ("小部屋", "広くない。白が近い。耳の奥で、誰かが息を吸う音。", base[2])
+        return base
+
+    def _connect(self, a, b):
+        ax, ay = a
+        bx, by = b
+        if ax == bx and ay == by:
+            return
+        if bx == ax+1 and by == ay:
+            self.adj[a]["e"] = b
+            self.adj[b]["w"] = a
+        elif bx == ax-1 and by == ay:
+            self.adj[a]["w"] = b
+            self.adj[b]["e"] = a
+        elif by == ay+1 and bx == ax:
+            self.adj[a]["s"] = b
+            self.adj[b]["n"] = a
+        elif by == ay-1 and bx == ax:
+            self.adj[a]["n"] = b
+            self.adj[b]["s"] = a
+
+    def _place_content(self):
+        # Choose some special rooms to host loot/logs
+        positions = list(self.rooms.keys())
+        positions.remove(self.start)
+        positions.remove(self.exit)
+        random.shuffle(positions)
+
+        # designate themed rooms by adding special tags probabilistically
+        # pick one storage-like and one surveillance-like to increase structure
+        storage = positions.pop()
+        self.rooms[storage].special = "storage"
+        self.rooms[storage].name = "保管庫"
+        self.rooms[storage].base_desc = "箱。棚。白いラベル。指の跡。奥の暗がりが、口みたいに見える。"
+        self.rooms[storage].stealth = 2
+
+        surveil = positions.pop()
+        self.rooms[surveil].special = "surveillance"
+        self.rooms[surveil].name = "監視室"
+        self.rooms[surveil].base_desc = "黒いガラス。反射に、自分が遅れて映る。小さく、機械の唸り。"
+        self.rooms[surveil].stealth = 0
+
+        record = positions.pop()
+        self.rooms[record].special = "records"
+        self.rooms[record].name = "記録室"
+        self.rooms[record].base_desc = "棚。ファイル。紙の匂い。端が湿っている。誰かの会話が貼り付いている。"
+        self.rooms[record].stealth = 1
+
+        # Place key in storage or nearby to align with hints
+        self.rooms[storage].loot.append("key")
+
+        # Place core items
+        item_pool = ["cloth", "battery", "salt", "tape", "mirror", "tape", "salt"]
+        for item in item_pool:
+            if not positions:
+                break
+            p = positions.pop()
+            self.rooms[p].loot.append(item)
+
+        # Place logs (dialogue fragments)
+        log_ids = list(self.logs.keys())
+        random.shuffle(log_ids)
+        for lid in log_ids:
+            # put certain hints in structural rooms
+            if lid == "L04":
+                self.rooms[surveil].logs.append(lid)
+                continue
+            if lid == "L01":
+                self.rooms[record].logs.append(lid)
+                continue
+            if lid == "L06":
+                # near exit to make it feel like late-game dread
+                near = self._nearest_free_room(self.exit, exclude={self.start, self.exit})
+                self.rooms[near].logs.append(lid)
+                continue
+
+            if not positions:
+                # fallback: random room
+                rp = random.choice(list(self.rooms.keys()))
+                if rp != self.start and rp != self.exit:
+                    self.rooms[rp].logs.append(lid)
+                continue
+            p = positions.pop()
+            self.rooms[p].logs.append(lid)
+
+    def _nearest_free_room(self, target, exclude=set()):
+        # pick a room near target
+        candidates = [pos for pos in self.rooms.keys() if pos not in exclude]
+        candidates.sort(key=lambda p: manhattan(p, target))
+        return candidates[0]
+
+    def _spawn_hunter(self):
+        # spawn far from player initially
+        candidates = [p for p in self.rooms.keys() if p != self.start]
+        candidates.sort(key=lambda p: manhattan(p, self.start), reverse=True)
+        self.hunter_pos = random.choice(candidates[:6])
+
+    def footsteps_level(self):
+        d = manhattan(self.player_pos, self.hunter_pos)
+        if d <= 0:
+            return "ここにいる"
+        if d == 1:
+            return "すぐそこ"
+        if d == 2:
+            return "近い"
+        if d <= 4:
+            return "遠くない"
+        return "遠い"
+
+    def print_room_header(self):
+        room = self.rooms[self.player_pos]
+        print("\n" + "="*WRAP)
+        print(f"TURN {self.turn} | {room.name}")
+        print("-"*WRAP)
+        print(wrap(room.desc(self)))
+        print("-"*WRAP)
+        print(wrap(f"足音：{self.footsteps_level()}"))
+        if self.salt_turns > 0:
+            print(wrap("床の塩が、かすかに白く光っている。"))
+        print("="*WRAP)
+
+    def show_actions(self):
+        moves = self.adj[self.player_pos]
+        mv = " ".join([d.upper() for d in moves.keys()]) if moves else "(なし)"
+        print(wrap(f"移動可能：{mv}"))
+        print("行動: n/s/e/w | search | use | rest | status | help | quit")
+
+    def help(self):
+        print(wrap(
+            "n/s/e/wで移動。searchで部屋を調べる。useでアイテム使用。"
+            "restは少し回復することがあるが危険。"
+            "出口(非常扉)で鍵を使え。長引くほど不利。"
+        ))
+
+    def status(self):
+        print(wrap(f"HP:{self.player_hp}/10  SAN:{self.player_san}/70  NOISE:{self.player_noise}  所持:{len(self.player_inv)}"))
+        if self.player_inv:
+            for i, it in enumerate(self.player_inv, 1):
+                nm, _ = self.items[it]
+                print(f"  {i}. {nm}")
+
+    def random_room_whisper(self):
+        # ambient lines; more intense when sanity is low or hunter is near
+        d = manhattan(self.player_pos, self.hunter_pos)
+        lines = [
+            "壁の白が、薄い皮膚みたいに見える。",
+            "どこかで金属が触れ合う音。短い。すぐ止まる。",
+            "自分の靴音が、一拍遅れて返ってくる。",
+            "誰かが、笑いかけた気がする。音はしない。",
+            "まぶたの裏に、黒い点が増える。",
+        ]
+        if d <= 2:
+            lines += [
+                "足音が、数を間違えている。",
+                "気配が、ドアの向こうで立ち止まった。",
+                "床が軋んだ。あなたは動いていない。",
+            ]
+        if self.player_san <= 30:
+            lines += [
+                "白が、あなたの名前を知っている。",
+                "ここは道じゃない。口だ。",
+            ]
+        if random.random() < 0.40:
+            print(wrap(random.choice(lines)))
+
+    def tick(self):
+        # Called after each player action (except help/status maybe, but we do it anyway for pressure)
+        self.turn += 1
+
+        # Passive sanity drain if lingering
+        if self.turn % 3 == 0:
+            self.player_san -= 1
+
+        # Noise decays slowly
+        if self.player_noise > 0:
+            self.player_noise = max(0, self.player_noise - 1)
+
+        # Salt ward decays
+        if self.salt_turns > 0:
+            self.salt_turns -= 1
+
+        # Hunter moves
+        self.hunter_move()
+
+        # Encounter check
+        if self.hunter_pos == self.player_pos:
+            self.encounter()
+
+        # Late game distortion
+        if self.turn >= 30 and random.random() < 0.25:
+            self.player_san -= 2
+            print(wrap("白が濃くなる。息が、喉の奥で引っかかる。"))
+
+        # clamp
+        self.player_san = max(0, self.player_san)
+        self.player_hp = max(0, self.player_hp)
+
+        # death checks
+        if self.player_hp <= 0:
+            self.end_death("体が言うことをきかない。床の冷たさだけが、はっきりしている。")
+        if self.player_san <= 0:
+            self.end_death("出口の形がほどける。廊下が笑う。あなたは、戻る。")
+
+    def hunter_move(self):
+        # Hunter has modes influenced by noise and distance.
+        d = manhattan(self.hunter_pos, self.player_pos)
+        noise = self.player_noise
+
+        # chance to "home in"
+        base_seek = 0.20
+        base_seek += 0.05 * max(0, 6 - d)
+        base_seek += 0.03 * noise
+        if self.salt_turns > 0:
+            base_seek -= 0.15  # ward makes it less consistent
+        base_seek = min(0.85, max(0.05, base_seek))
+
+        seek = random.random() < base_seek
+        moves = list(self.adj[self.hunter_pos].values())
+        if not moves:
+            return
+
+        if seek:
+            # choose move that reduces distance, but not perfectly
+            scored = []
+            for m in moves:
+                nd = manhattan(m, self.player_pos)
+                w = 1.0
+                if nd < d: w = 3.2
+                elif nd == d: w = 1.2
+                else: w = 0.6
+                # if ward active, it sometimes hesitates to cross "into" player's vicinity
+                if self.salt_turns > 0 and manhattan(m, self.player_pos) <= 1 and random.random() < 0.45:
+                    w *= 0.2
+                scored.append((m, w))
+            self.hunter_pos = rng_choice_weighted(scored)
+        else:
+            # wander
+            self.hunter_pos = random.choice(moves)
+
+    def encounter(self):
+        print("\n" + wrap("足音が止まる。止まった場所が、あなたの背後になっている。"))
+        if self.salt_turns > 0 and random.random() < 0.55:
+            print(wrap("塩の白が、いっとう明るくなる。気配が、わずかに引く。"))
+            # still dangerous, but a chance to slip away
+        action = self.prompt_encounter()
+        if action == "hide":
+            self.try_hide()
+        elif action == "run":
+            self.try_run()
+        else:
+            self.try_fight()
+
+    def prompt_encounter(self):
+        while True:
+            print("遭遇: hide(隠れる) / run(逃げる) / fight(抗う)")
+            s = input("> ").strip().lower()
+            if s in ("hide", "run", "fight"):
+                return s
+
+    def try_hide(self):
+        room = self.rooms[self.player_pos]
+        d = manhattan(self.player_pos, self.hunter_pos)  # 0
+        # hide success depends on room stealth, salt, low noise, some sanity (panic hurts)
+        chance = 0.20 + 0.12 * room.stealth
+        chance += 0.15 if self.salt_turns > 0 else 0.0
+        chance -= 0.02 * self.player_noise
+        chance += 0.05 if self.player_san >= 40 else -0.05
+        chance = max(0.05, min(0.75, chance))
+
+        print(wrap("息を止める。白い壁に、影を貼り付ける。"))
+        if random.random() < chance:
+            print(wrap("足音が、あなたを通り過ぎる。数が合わないまま、遠ざかる。"))
+            # hunter moves away a step
+            self.hunter_move()
+            self.player_san = max(0, self.player_san - 1)
+        else:
+            dmg = random.randint(4, 7)
+            self.player_hp -= dmg
+            self.player_san -= 6
+            print(wrap("指先に冷たいものが触れる。掴まれる。骨が鳴る。"))
+            print(wrap(f"HP -{dmg}"))
+            if self.player_hp <= 0:
+                self.end_death("白が赤を飲む。あなたの音が、止まる。")
+
+    def try_run(self):
+        # attempt to flee to adjacent room; failure causes damage and hunter follows
+        moves = self.adj[self.player_pos]
+        if not moves:
+            print(wrap("逃げ道がない。白が近い。"))
+            self.try_hide()
+            return
+
+        # choose direction
+        dirs = list(moves.keys())
+        print(wrap(f"逃げる方向: {'/'.join([d.upper() for d in dirs])}"))
+        d = input("> ").strip().lower()
+        if d not in moves:
+            d = random.choice(dirs)
+
+        # success chance
+        chance = 0.60
+        chance -= 0.10 if self.player_san <= 25 else 0.0
+        chance += 0.10 if self.salt_turns > 0 else 0.0
+        chance = max(0.20, min(0.85, chance))
+
+        if random.random() < chance:
+            self.player_pos = moves[d]
+            self.player_noise += 4
+            print(wrap("床が鳴る。あなたの足音が増える。"))
+            # hunter may follow with probability
+            if random.random() < 0.55:
+                self.hunter_pos = self.player_pos
+                print(wrap("同じ気配が、扉の向こうから追いつく。"))
+                self.encounter()
+        else:
+            dmg = random.randint(2, 5)
+            self.player_hp -= dmg
+            self.player_san -= 4
+            self.player_noise += 5
+            print(wrap("足がもつれる。白い床が、あなたを引く。"))
+            print(wrap(f"HP -{dmg}"))
+            # hunter stays
+            if self.player_hp <= 0:
+                self.end_death("痛みが途切れる。途切れた場所から、足音が入ってくる。")
+
+    def try_fight(self):
+        print(wrap("拳が当たった感触がない。ぶつかったのは、冷たい空気だけ。"))
+        # almost always lethal
+        if random.random() < 0.85:
+            self.end_death("次の瞬間、あなたの視界から白が消える。")
+        else:
+            # miracle: you slip away at huge cost
+            self.player_hp -= 6
+            self.player_san -= 10
+            self.player_noise += 6
+            print(wrap("痛みで意識が飛びそうになる。だが、足が勝手に動く。"))
+            # force move
+            moves = list(self.adj[self.player_pos].values())
+            if moves:
+                self.player_pos = random.choice(moves)
+            # hunter moves away
+            self.hunter_move()
+
+    def search(self):
+        room = self.rooms[self.player_pos]
+        self.player_noise += 1
+        if not room.searched:
+            print(wrap("手を伸ばす。白の隙間を探る。"))
+            room.searched = True
+
+            # if there are logs, reveal one
+            if room.logs:
+                lid = room.logs.pop(0)
+                self.play_log(lid, auto=True)
+
+            # loot
+            if room.loot:
+                found = room.loot.pop(0)
+                nm, desc = self.items[found]
+                self.player_inv.append(found)
+                print(wrap(f"見つけた：{nm}"))
+                if found == "key":
+                    self.flags.add("has_key")
+                # small flavor
+                if random.random() < 0.60:
+                    print(wrap(desc))
+            else:
+                # sometimes nothing but dread
+                if random.random() < 0.75:
+                    print(wrap("何もない。…いや、ないはずなのに、指が濡れる。"))
+                    self.player_san -= 2
+        else:
+            # searching again increases dread
+            print(wrap("同じ場所。なのに、触感だけが違う。"))
+            self.player_san -= 1
+            if random.random() < 0.30:
+                self.player_noise += 2
+
+    def play_log(self, lid, auto=False):
+        log = self.logs.get(lid)
+        if not log:
+            print(wrap("再生できない。テープが絡まっている。"))
+            return
+        title = log["title"]
+        print("\n" + wrap(f"--- {title} ---"))
+        for line in log["text"]:
+            print(wrap(line))
+        print(wrap("---"))
+        self.seen_logs.add(lid)
+        for f in log.get("flags", set()):
+            self.flags.add(f)
+
+        # sanity effect: logs can both hurt and help (meaning is a double-edged knife)
+        if auto:
+            self.player_san -= 1
+        else:
+            self.player_san -= 2
+            self.player_noise += 1
+
+    def use_item(self):
+        if not self.player_inv:
+            print(wrap("手元に何もない。"))
+            return
+        print(wrap("どれを使う？ 番号を入力。"))
+        for i, it in enumerate(self.player_inv, 1):
+            nm, _ = self.items[it]
+            print(f"  {i}. {nm}")
+        s = input("> ").strip()
+        if not s.isdigit():
+            return
+        idx = int(s) - 1
+        if idx < 0 or idx >= len(self.player_inv):
+            return
+        it = self.player_inv[idx]
+
+        if it == "cloth":
+            heal = random.randint(2, 4)
+            self.player_hp = min(10, self.player_hp + heal)
+            self.player_noise += 1
+            print(wrap("布の匂いが強い。痛みが少し遠のく。"))
+            print(wrap(f"HP +{heal}"))
+            self.player_inv.pop(idx)
+
+        elif it == "battery":
+            # battery reduces future penalty in dark rooms (we simulate by small sanity boost)
+            self.player_san = min(70, self.player_san + 3)
+            self.player_noise += 1
+            print(wrap("明かりが保たれる感じがする。白の輪郭が、少しだけ“普通”に戻る。"))
+            self.player_inv.pop(idx)
+
+        elif it == "salt":
+            self.salt_turns = 6
+            self.player_noise += 2
+            print(wrap("塩を落とす。白の上の白が、線になる。"))
+            self.player_inv.pop(idx)
+
+        elif it == "tape":
+            # play a random unseen log if any remain undiscovered
+            unseen = [k for k in self.logs.keys() if k not in self.seen_logs]
+            if unseen:
+                lid = random.choice(unseen)
+                self.play_log(lid, auto=False)
+            else:
+                print(wrap("テープはもう、同じ声しか出さない。"))
+                self.player_san -= 1
+            self.player_inv.pop(idx)
+
+        elif it == "mirror":
+            # mirror protects against late-game sanity spikes slightly
+            self.flags.add("has_mirror")
+            self.player_noise += 1
+            print(wrap("鏡に映った自分の目が、少しだけ遅れて瞬く。"))
+            print(wrap("直接見ない。反射で見る。それだけで、足元が少し確かになる。"))
+            # keep mirror (not consumed)
+
+        elif it == "key":
+            # key only works at exit
+            print(wrap("ここで使う鍵じゃない。冷たさだけが残る。"))
+            self.player_noise += 1
+
+        else:
+            print(wrap("うまく使えない。"))
+
+    def rest(self):
+        # risky recovery
+        print(wrap("床に体重を預ける。白が近い。"))
+        self.player_noise += 1
+        if random.random() < 0.55:
+            heal = random.randint(1, 3)
+            self.player_hp = min(10, self.player_hp + heal)
+            self.player_san = min(70, self.player_san + 1)
+            print(wrap(f"少し戻る。HP +{heal}"))
+        else:
+            self.player_san -= 3
+            print(wrap("眠れない。まぶたの裏で、足音が歩く。"))
+
+        # resting increases chance hunter closes in
+        self.player_noise += 2
+
+    def try_exit(self):
+        room = self.rooms[self.player_pos]
+        if room.special != "exit":
+            return False
+        print(wrap("非常扉の前。取っ手が冷たい。"))
+        if "has_key" not in self.flags:
+            print(wrap("鍵穴がある。手元が空っぽだ。"))
+            return True
+
+        # exit puzzle: hinted by L06 (left)
+        knows = "hint_exit_left" in self.flags
+        prompt = "取っ手をどう動かす？ left / right"
+        print(wrap(prompt))
+        s = input("> ").strip().lower()
+        if s not in ("left", "right"):
+            s = "right"
+
+        if knows and s == "left":
+            self.end_escape(true_end=("L01" in self.seen_logs and "L04" in self.seen_logs))
+        else:
+            # wrong: heavy penalty and hunter spike
+            print(wrap("金属が嫌な音を立てる。扉が、開かない。"))
+            self.player_hp -= 2
+            self.player_san -= 6
+            self.player_noise += 6
+            # hunter teleports closer sometimes to feel like punishment
+            if random.random() < 0.70:
+                self.hunter_pos = self.player_pos
+                self.encounter()
+        return True
+
+    def end_escape(self, true_end=False):
+        print("\n" + "="*WRAP)
+        if true_end:
+            print(wrap("扉が開く。風の匂い。白が背後で閉じる。"))
+            print(wrap("外の暗さが、やっと暗い。"))
+            print(wrap("足音は…まだ、ついてきていない。たぶん。"))
+            print(wrap("TRUE END：脱出（意味が揃った）"))
+        else:
+            print(wrap("扉が開く。風の匂い。白が背後で閉じる。"))
+            print(wrap("振り向かない。振り向けば、白は続く。"))
+            print(wrap("NORMAL END：脱出（後味が残る）"))
+        print("="*WRAP)
+        sys.exit(0)
+
+    def end_death(self, text):
+        print("\n" + "="*WRAP)
+        print(wrap(text))
+        print(wrap("END：死亡"))
+        print("="*WRAP)
+        sys.exit(0)
+
+def main():
+    random.seed()  # change to fixed number for reproducible runs
+    w = World()
+
+    print(wrap("白い天井。喉が乾いている。"))
+    print(wrap("遠くで、足音。"))
+    print(wrap("help と打てば説明。"))
+    while True:
+        # Before showing room, check exit interaction if standing there
+        if w.try_exit():
+            # exit interaction consumed the turn via penalties, but not always
+            pass
+
+        w.print_room_header()
+        w.random_room_whisper()
+        w.show_actions()
+
+        cmd = input("> ").strip().lower()
+
+        if cmd in ("quit", "q", "exitgame"):
+            print(wrap("画面が暗くなる。白は、まだそこにある。"))
+            break
+
+        if cmd in ("help", "h"):
+            w.help()
+            # Pressure: still tick time a little to keep dread
+            w.tick()
+            continue
+
+        if cmd in ("status", "st"):
+            w.status()
+            w.tick()
+            continue
+
+        if cmd in ("search", "se"):
+            w.search()
+            w.tick()
+            continue
+
+        if cmd in ("use", "u"):
+            w.use_item()
+            w.tick()
+            continue
+
+        if cmd in ("rest", "r"):
+            w.rest()
+            w.tick()
+            continue
+
+        # movement
+        if cmd in ("n", "s", "e", "w"):
+            moves = w.adj[w.player_pos]
+            if cmd in moves:
+                w.player_pos = moves[cmd]
+                w.player_noise += 1
+                # entering certain rooms triggers auto-log occasionally
+                room = w.rooms[w.player_pos]
+                if room.logs and random.random() < 0.35:
+                    lid = room.logs.pop(0)
+                    w.play_log(lid, auto=True)
+            else:
+                print(wrap("壁。白い。近い。"))
+                w.player_san -= 1
+                w.player_noise += 1
+            w.tick()
+            continue
+
+        # unknown command
+        print(wrap("その動きは、ここではうまくいかない。"))
+        w.player_san -= 1
+        w.tick()
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n" + wrap("手が止まる。足音は止まらない。"))
